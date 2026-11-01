@@ -61,6 +61,21 @@ func TestRecordCRUDAndApiKey(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "POST /api/records") {
 		t.Fatalf("logs returned %d: %s", response.Code, response.Body.String())
 	}
+	request = httptest.NewRequest(http.MethodPut, "/api/logs/settings", strings.NewReader(`{"persistent":false,"retentionDays":45,"maxRows":2000}`))
+	request.Header.Set("Authorization", "Bearer test-key")
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"retentionDays":45`) {
+		t.Fatalf("log settings update returned %d: %s", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, "/api/logs/status", nil)
+	request.Header.Set("Authorization", "Bearer test-key")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"persistent":false`) {
+		t.Fatalf("log status returned %d: %s", response.Code, response.Body.String())
+	}
 }
 
 func TestInitialSetupLoginAndSessionAuthorization(t *testing.T) {

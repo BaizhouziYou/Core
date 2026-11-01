@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"easybot/internal/runtime"
 	"github.com/google/uuid"
 )
 
@@ -65,8 +66,8 @@ func TestSchemaMigrationIsRecorded(t *testing.T) {
 	if err := db.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Fatalf("expected schema version 2, got %d", version)
+	if version != 4 {
+		t.Fatalf("expected schema version 4, got %d", version)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -76,7 +77,7 @@ func TestSchemaMigrationIsRecorded(t *testing.T) {
 		t.Fatalf("reopening migrated database: %v", err)
 	}
 	defer db.Close()
-	if err := db.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 2 {
+	if err := db.db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 4 {
 		t.Fatalf("repeated startup changed migration version to %d, error %v", version, err)
 	}
 }
@@ -97,8 +98,8 @@ func TestExternalDatabaseContract(t *testing.T) {
 	defer db.Close()
 
 	var version int
-	if err := db.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 2 {
-		t.Fatalf("expected migration version 2, got %d, error %v", version, err)
+	if err := db.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 4 {
+		t.Fatalf("expected migration version 4, got %d, error %v", version, err)
 	}
 
 	if _, err := db.db.ExecContext(ctx,
@@ -139,6 +140,17 @@ func TestExternalDatabaseContract(t *testing.T) {
 	if err := db.db.QueryRowContext(ctx, db.query(`SELECT COUNT(*) FROM sessions WHERE token_hash=?`), "contract-session").Scan(&sessionCount); err != nil || sessionCount != 1 {
 		t.Fatalf("session insert failed: count=%d error=%v", sessionCount, err)
 	}
+	if err := db.WriteLog(ctx, runtime.LogEntry{ID: "contract-log", Time: time.Now().UTC(), Level: "warn", Source: "contract", Message: "redacted token=[REDACTED]"}); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := db.GetLogSettings(ctx)
+	if err != nil || !settings.Persistent || settings.RetentionDays != 30 || settings.MaxRows != 100000 {
+		t.Fatalf("default log settings: %#v error %v", settings, err)
+	}
+	settings.RetentionDays = 90
+	if err := db.SaveLogSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -148,7 +160,7 @@ func TestExternalDatabaseContract(t *testing.T) {
 		t.Fatalf("reopening migrated database failed: %v", err)
 	}
 	defer db.Close()
-	if err := db.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 2 {
+	if err := db.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 4 {
 		t.Fatalf("restart changed migration version: version=%d error=%v", version, err)
 	}
 	if got, err := db.List(ctx, "servers"); err != nil || len(got) != 1 || got[0].Name != "contract-server-updated" {
@@ -156,6 +168,50 @@ func TestExternalDatabaseContract(t *testing.T) {
 	}
 	if _, ok, err := db.AuthenticateAdmin(ctx, "contract-admin", "test-password"); err != nil || !ok {
 		t.Fatalf("admin did not survive database restart: ok=%v error=%v", ok, err)
+	}
+	logs, total, err := db.ListLogs(ctx, LogFilter{Level: "warn", Component: "contract", Limit: 10})
+	if err != nil || total != 1 || len(logs) != 1 || logs[0].Message != "redacted token=[REDACTED]" {
+		t.Fatalf("runtime log did not survive restart/filter: logs=%#v total=%d error=%v", logs, total, err)
+	}
+	settings, err = db.GetLogSettings(ctx)
+	if err != nil || settings.RetentionDays != 90 {
+		t.Fatalf("log settings did not survive restart: %#v error %v", settings, err)
+	}
+}
+
+func TestRuntimeLogsFilteringRedactionAndRetention(t *testing.T) {
+	db, err := Open(t.TempDir() + "/easybot.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	if err := db.WriteLog(ctx, runtime.LogEntry{ID: "old", Time: old, Level: "info", Source: "api", Message: "Bearer abcdef token=secret"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteLog(ctx, runtime.LogEntry{ID: "new-1", Time: time.Now().UTC(), Level: "error", Source: "api", Message: "request failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteLog(ctx, runtime.LogEntry{ID: "new-2", Time: time.Now().UTC().Add(time.Millisecond), Level: "warn", Source: "runtime", Message: "retained"}); err != nil {
+		t.Fatal(err)
+	}
+	logs, total, err := db.ListLogs(ctx, LogFilter{Query: "request", Limit: 10})
+	if err != nil || total != 1 || len(logs) != 1 {
+		t.Fatalf("filtered log query: items=%#v total=%d error=%v", logs, total, err)
+	}
+	removed, err := db.CleanupLogs(ctx, time.Now().UTC().Add(-24*time.Hour), 100)
+	if err != nil || removed != 1 {
+		t.Fatalf("retention cleanup removed %d, error %v", removed, err)
+	}
+	logs, total, err = db.ListLogs(ctx, LogFilter{Limit: 10})
+	if err != nil || total != 2 || len(logs) != 2 {
+		t.Fatalf("retention result: items=%#v total=%d error=%v", logs, total, err)
+	}
+	for _, entry := range logs {
+		if entry.ID == "old" || entry.Message == "Bearer abcdef token=secret" {
+			t.Fatalf("old or unredacted log remains: %#v", entry)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"easybot/internal/runtime"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -161,9 +162,211 @@ func (s *Store) migrate(ctx context.Context) error {
 			tx.Rollback()
 			return err
 		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		version = 2
+	}
+	if version < 3 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		statements := []string{
+			`CREATE TABLE IF NOT EXISTS runtime_logs (
+				id VARCHAR(64) PRIMARY KEY, occurred_at TIMESTAMP NOT NULL, level VARCHAR(16) NOT NULL,
+				component VARCHAR(96) NOT NULL, message TEXT NOT NULL, request_id VARCHAR(128) NOT NULL DEFAULT '')`,
+			`CREATE INDEX idx_runtime_logs_occurred ON runtime_logs(occurred_at)`,
+			`CREATE INDEX idx_runtime_logs_level_time ON runtime_logs(level, occurred_at)`,
+			`CREATE INDEX idx_runtime_logs_component_time ON runtime_logs(component, occurred_at)`,
+		}
+		for _, statement := range statements {
+			if _, err = tx.ExecContext(ctx, statement); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, s.query(`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`), 3, time.Now().UTC()); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		version = 3
+	}
+	if version < 4 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS runtime_log_settings (
+			id INTEGER PRIMARY KEY, persistent BOOLEAN NOT NULL, retention_days INTEGER NOT NULL,
+			max_rows INTEGER NOT NULL, updated_at TIMESTAMP NOT NULL)`); err != nil {
+			tx.Rollback()
+			return err
+		}
+		seed := `INSERT INTO runtime_log_settings(id,persistent,retention_days,max_rows,updated_at) VALUES(1,TRUE,30,100000,?)`
+		switch s.dialect {
+		case "sqlite":
+			seed = `INSERT OR IGNORE INTO runtime_log_settings(id,persistent,retention_days,max_rows,updated_at) VALUES(1,TRUE,30,100000,?)`
+		case "mysql":
+			seed = `INSERT IGNORE INTO runtime_log_settings(id,persistent,retention_days,max_rows,updated_at) VALUES(1,TRUE,30,100000,?)`
+		case "postgres":
+			seed = `INSERT INTO runtime_log_settings(id,persistent,retention_days,max_rows,updated_at) VALUES(1,TRUE,30,100000,?) ON CONFLICT(id) DO NOTHING`
+		}
+		if _, err = tx.ExecContext(ctx, s.query(seed), time.Now().UTC()); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, s.query(`INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`), 4, time.Now().UTC()); err != nil {
+			tx.Rollback()
+			return err
+		}
 		return tx.Commit()
 	}
 	return nil
+}
+
+type LogSettings struct {
+	Persistent    bool      `json:"persistent"`
+	RetentionDays int       `json:"retentionDays"`
+	MaxRows       int       `json:"maxRows"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+func (s *Store) GetLogSettings(ctx context.Context) (LogSettings, error) {
+	var settings LogSettings
+	err := s.db.QueryRowContext(ctx, `SELECT persistent,retention_days,max_rows,updated_at FROM runtime_log_settings WHERE id=1`).Scan(&settings.Persistent, &settings.RetentionDays, &settings.MaxRows, &settings.UpdatedAt)
+	return settings, err
+}
+
+func (s *Store) SaveLogSettings(ctx context.Context, settings LogSettings) error {
+	_, err := s.db.ExecContext(ctx, s.query(`UPDATE runtime_log_settings SET persistent=?,retention_days=?,max_rows=?,updated_at=? WHERE id=1`), settings.Persistent, settings.RetentionDays, settings.MaxRows, time.Now().UTC())
+	return err
+}
+
+type LogFilter struct {
+	Level     string
+	Component string
+	RequestID string
+	Query     string
+	From      *time.Time
+	To        *time.Time
+	Limit     int
+	Offset    int
+}
+
+func (s *Store) WriteLog(ctx context.Context, entry runtime.LogEntry) error {
+	_, err := s.db.ExecContext(ctx, s.query(`INSERT INTO runtime_logs(id,occurred_at,level,component,message,request_id) VALUES(?,?,?,?,?,?)`), entry.ID, entry.Time.UTC(), entry.Level, entry.Source, runtime.Redact(entry.Message), entry.RequestID)
+	return err
+}
+
+func (s *Store) ListLogs(ctx context.Context, filter LogFilter) ([]runtime.LogEntry, int, error) {
+	where := []string{"1=1"}
+	args := make([]any, 0, 6)
+	if filter.Level != "" {
+		where = append(where, "level=?")
+		args = append(args, filter.Level)
+	}
+	if filter.Component != "" {
+		where = append(where, "component=?")
+		args = append(args, filter.Component)
+	}
+	if filter.RequestID != "" {
+		where = append(where, "request_id=?")
+		args = append(args, filter.RequestID)
+	}
+	if filter.From != nil {
+		where = append(where, "occurred_at>=?")
+		args = append(args, filter.From.UTC())
+	}
+	if filter.To != nil {
+		where = append(where, "occurred_at<?")
+		args = append(args, filter.To.UTC())
+	}
+	if filter.Query != "" {
+		where = append(where, "message LIKE ?")
+		args = append(args, "%"+filter.Query+"%")
+	}
+	clause := strings.Join(where, " AND ")
+	var total int
+	if err := s.db.QueryRowContext(ctx, s.query("SELECT COUNT(*) FROM runtime_logs WHERE "+clause), args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if filter.Limit < 1 || filter.Limit > 500 {
+		filter.Limit = 100
+	}
+	if filter.Offset < 0 {
+		filter.Offset = 0
+	}
+	args = append(args, filter.Limit, filter.Offset)
+	rows, err := s.db.QueryContext(ctx, s.query("SELECT id,occurred_at,level,component,message,request_id FROM runtime_logs WHERE "+clause+" ORDER BY occurred_at DESC,id DESC LIMIT ? OFFSET ?"), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	items := make([]runtime.LogEntry, 0)
+	for rows.Next() {
+		var entry runtime.LogEntry
+		if err := rows.Scan(&entry.ID, &entry.Time, &entry.Level, &entry.Source, &entry.Message, &entry.RequestID); err != nil {
+			return nil, 0, err
+		}
+		items = append(items, entry)
+	}
+	return items, total, rows.Err()
+}
+
+func (s *Store) CleanupLogs(ctx context.Context, before time.Time, maxRows int) (int64, error) {
+	result, err := s.db.ExecContext(ctx, s.query(`DELETE FROM runtime_logs WHERE occurred_at<?`), before.UTC())
+	if err != nil {
+		return 0, err
+	}
+	removed, err := result.RowsAffected()
+	if err != nil || maxRows < 1 {
+		return removed, err
+	}
+	for {
+		rows, queryErr := s.db.QueryContext(ctx, s.query(`SELECT id FROM runtime_logs ORDER BY occurred_at DESC,id DESC LIMIT ? OFFSET ?`), 500, maxRows)
+		if queryErr != nil {
+			return removed, queryErr
+		}
+		ids := make([]string, 0, 500)
+		for rows.Next() {
+			var id string
+			if scanErr := rows.Scan(&id); scanErr != nil {
+				rows.Close()
+				return removed, scanErr
+			}
+			ids = append(ids, id)
+		}
+		queryErr = rows.Err()
+		rows.Close()
+		if queryErr != nil {
+			return removed, queryErr
+		}
+		if len(ids) == 0 {
+			return removed, nil
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		result, err = s.db.ExecContext(ctx, s.query(`DELETE FROM runtime_logs WHERE id IN (`+placeholders+`)`), stringArgs(ids)...)
+		if err != nil {
+			return removed, err
+		}
+		count, err := result.RowsAffected()
+		removed += count
+		if err != nil || len(ids) < 500 {
+			return removed, err
+		}
+	}
+}
+
+func stringArgs(values []string) []any {
+	args := make([]any, len(values))
+	for i, value := range values {
+		args[i] = value
+	}
+	return args
 }
 
 type Admin struct {

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ type server struct {
 	store         *store.Store
 	logger        *slog.Logger
 	logs          *runtime.LogBuffer
+	logWriter     *runtime.AsyncLogWriter
 	loginMu       sync.Mutex
 	loginAttempts map[string]loginAttempt
 }
@@ -40,8 +42,11 @@ type loginAttempt struct {
 const sessionCookie = "easybot_session"
 const sessionLifetime = 12 * time.Hour
 
-func New(db *store.Store, logger *slog.Logger, logs *runtime.LogBuffer) http.Handler {
+func New(db *store.Store, logger *slog.Logger, logs *runtime.LogBuffer, writers ...*runtime.AsyncLogWriter) http.Handler {
 	s := &server{store: db, logger: logger, logs: logs, loginAttempts: make(map[string]loginAttempt)}
+	if len(writers) > 0 {
+		s.logWriter = writers[0]
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/app/info", s.info)
@@ -62,6 +67,8 @@ func New(db *store.Store, logger *slog.Logger, logs *runtime.LogBuffer) http.Han
 	mux.HandleFunc("POST /api/adapter/{id}/start", s.adapterStart)
 	mux.HandleFunc("POST /api/adapter/{id}/stop", s.adapterStop)
 	mux.HandleFunc("GET /api/logs", s.recentLogs)
+	mux.HandleFunc("GET /api/logs/status", s.logStatus)
+	mux.HandleFunc("PUT /api/logs/settings", s.updateLogSettings)
 	mux.Handle("/", http.FileServer(http.Dir("web/dist")))
 	return s.observe(s.security(s.cors(mux)))
 }
@@ -96,7 +103,99 @@ func (s *server) recentLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "limit must be between 1 and 500"})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.logs.Recent(limit))
+	offset := 0
+	var err error
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		offset, err = strconv.Atoi(raw)
+	}
+	if err != nil || offset < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "offset must be a non-negative integer"})
+		return
+	}
+	filter := store.LogFilter{Level: r.URL.Query().Get("level"), Component: r.URL.Query().Get("component"), RequestID: r.URL.Query().Get("requestId"), Query: runtime.NormalizeLogFilterText(r.URL.Query().Get("q")), Limit: limit, Offset: offset}
+	if raw := r.URL.Query().Get("from"); raw != "" {
+		value, parseErr := time.Parse(time.RFC3339, raw)
+		if parseErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "from must be an RFC3339 timestamp"})
+			return
+		}
+		filter.From = &value
+	}
+	if raw := r.URL.Query().Get("to"); raw != "" {
+		value, parseErr := time.Parse(time.RFC3339, raw)
+		if parseErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "to must be an RFC3339 timestamp"})
+			return
+		}
+		filter.To = &value
+	}
+	items, total, err := s.store.ListLogs(r.Context(), filter)
+	if err != nil {
+		http.Error(w, "log query failed", http.StatusInternalServerError)
+		return
+	}
+	if offset == 0 {
+		seen := make(map[string]bool, len(items))
+		for _, item := range items {
+			seen[item.ID] = true
+		}
+		for _, item := range s.logs.Recent(500) {
+			if seen[item.ID] || (filter.Level != "" && item.Level != filter.Level) || (filter.Component != "" && item.Source != filter.Component) || (filter.RequestID != "" && item.RequestID != filter.RequestID) || (filter.Query != "" && !strings.Contains(strings.ToLower(item.Message), strings.ToLower(filter.Query))) || (filter.From != nil && item.Time.Before(*filter.From)) || (filter.To != nil && !item.Time.Before(*filter.To)) {
+				continue
+			}
+			items = append(items, item)
+			seen[item.ID] = true
+		}
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].Time.Equal(items[j].Time) {
+				return items[i].ID > items[j].ID
+			}
+			return items[i].Time.After(items[j].Time)
+		})
+		if len(items) > limit {
+			items = items[:limit]
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *server) logStatus(w http.ResponseWriter, r *http.Request) {
+	settings, err := s.store.GetLogSettings(r.Context())
+	if err != nil {
+		http.Error(w, "log settings unavailable", http.StatusInternalServerError)
+		return
+	}
+	status := map[string]any{"persistent": settings.Persistent, "retentionDays": settings.RetentionDays, "maxRows": settings.MaxRows, "updatedAt": settings.UpdatedAt, "droppedWrites": uint64(0), "failedWrites": uint64(0)}
+	if s.logWriter != nil {
+		status["droppedWrites"] = s.logWriter.Dropped()
+		status["failedWrites"] = s.logWriter.Failed()
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *server) updateLogSettings(w http.ResponseWriter, r *http.Request) {
+	var settings store.LogSettings
+	if !decode(w, r, &settings) {
+		return
+	}
+	if settings.RetentionDays < 1 || settings.RetentionDays > 3650 || settings.MaxRows < 1000 || settings.MaxRows > 10000000 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "retentionDays must be 1-3650 and maxRows must be 1000-10000000"})
+		return
+	}
+	if err := s.store.SaveLogSettings(r.Context(), settings); err != nil {
+		http.Error(w, "log settings update failed", http.StatusInternalServerError)
+		return
+	}
+	if s.logWriter != nil {
+		s.logWriter.SetEnabled(settings.Persistent)
+	}
+	s.logs.Add("info", "settings", "Runtime log retention settings updated")
+	updated, err := s.store.GetLogSettings(r.Context())
+	if err != nil {
+		http.Error(w, "log settings unavailable", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 type statusRecorder struct {
@@ -133,7 +232,7 @@ func (s *server) observe(next http.Handler) http.Handler {
 				level = "warn"
 			}
 			message := fmt.Sprintf("%s %s (%d) in %s", r.Method, r.URL.Path, status, time.Since(started).Round(time.Millisecond))
-			s.logs.Add(level, "api", message)
+			s.logs.AddWithRequestID(level, "api", message, r.Header.Get("X-Request-ID"))
 			s.logger.Log(r.Context(), levelFor(level), message, "status", status, "method", r.Method, "path", r.URL.Path)
 		}
 	})
