@@ -1,0 +1,41 @@
+name: Build and Test
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: dev/go.mod
+          cache-dependency-path: dev/go.sum
+      - name: Test
+        working-directory: dev
+        run: go test ./...
+      - name: Vet
+        working-directory: dev
+        run: go vet ./...
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dev/web/package-lock.json
+      - name: Install dependencies
+        working-directory: dev/web
+        run: npm ci
+      - name: Build
+        working-directory: dev/web
+        run: npm run build

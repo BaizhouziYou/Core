@@ -1,0 +1,27 @@
+# Local runtime data and secrets
+/dev/appdata/
+.env
+.env.*
+!.env.example
+
+# Go outputs
+/dev/bin/
+/dev/obj/
+
+# Frontend outputs and local tooling state
+/dev/web/node_modules/
+/dev/web/dist/
+/dev/web/.vscode/
+/dev/web/.idea/
+
+# Decompiled reference exports and bundled legacy releases
+/decompiled/
+/private-repo-export/
+/private-repo-export-windows/
+/easybot-dev-*/
+/dev/old/
+*.zip
+*.db
+*.db-shm
+*.db-wal
+*.log
