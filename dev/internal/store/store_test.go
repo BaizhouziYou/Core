@@ -102,7 +102,7 @@ func TestExternalDatabaseContract(t *testing.T) {
 	}
 
 	if _, err := db.db.ExecContext(ctx,
-		`INSERT INTO users(id,username,password_hash,created_at) VALUES(?,?,?,?)`,
+		db.query(`INSERT INTO users(id,username,password_hash,created_at) VALUES(?,?,?,?)`),
 		uuid.NewString(), "duplicate-user", "test-hash", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestExternalDatabaseContract(t *testing.T) {
 		t.Fatalf("admin authentication failed: ok=%v error=%v", ok, err)
 	}
 	var sessionCount int
-	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions WHERE token_hash=?`, "contract-session").Scan(&sessionCount); err != nil || sessionCount != 1 {
+	if err := db.db.QueryRowContext(ctx, db.query(`SELECT COUNT(*) FROM sessions WHERE token_hash=?`), "contract-session").Scan(&sessionCount); err != nil || sessionCount != 1 {
 		t.Fatalf("session insert failed: count=%d error=%v", sessionCount, err)
 	}
 
