@@ -13,7 +13,7 @@ EasybotCE 的主程序。当前重建项目由 Go HTTP API 和 Vue 3 管理台�
 
 ## License and attribution
 
-This repository is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/). Commercial use is not permitted by that license. When sharing or adapting this project, credit EasybotCE and link to this repository and the license, identify changes, and retain existing author, copyright, and license notices. See [`AUTHORS.md`](AUTHORS.md).
+This repository is licensed under [CC BY-NC 4.0 (`CC-BY-NC-4.0`)](https://creativecommons.org/licenses/by-nc/4.0/). Commercial use is not permitted by that license. When sharing or adapting this project, credit EasybotCE and link to this repository and the license, identify changes, and retain existing author, copyright, and license notices. See [`AUTHORS.md`](AUTHORS.md).
 
 ## 开发
 
