@@ -57,6 +57,14 @@ func TestRecordCRUDAndApiKey(t *testing.T) {
 	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `Onebot11`) {
 		t.Fatalf("adapter create returned %d: %s", response.Code, response.Body.String())
 	}
+	request = httptest.NewRequest(http.MethodPost, "/api/adapter/create", strings.NewReader(`{"adapterType":"Telegram","displayName":"unsupported","configJson":"{}"}`))
+	request.Header.Set("Authorization", "Bearer test-key")
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotImplemented {
+		t.Fatalf("unsupported adapter returned %d: %s", response.Code, response.Body.String())
+	}
 	request = httptest.NewRequest(http.MethodGet, "/api/logs?limit=10", nil)
 	request.Header.Set("Authorization", "Bearer test-key")
 	response = httptest.NewRecorder()

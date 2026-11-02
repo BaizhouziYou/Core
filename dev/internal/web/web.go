@@ -328,9 +328,6 @@ func (s *server) deleteRecord(w http.ResponseWriter, r *http.Request) {
 func (s *server) adapterTypes(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, []map[string]string{
 		{"adapterType": "Onebot11", "displayName": "OneBot 11", "platformName": "onebot11"},
-		{"adapterType": "Milky", "displayName": "Milky", "platformName": "milky"},
-		{"adapterType": "Telegram", "displayName": "Telegram", "platformName": "telegram"},
-		{"adapterType": "OpenQQ", "displayName": "OpenQQ", "platformName": "openqq"},
 	})
 }
 
@@ -355,8 +352,8 @@ func (s *server) createAdapter(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	if body.AdapterType != "Onebot11" && body.AdapterType != "Milky" && body.AdapterType != "Telegram" && body.AdapterType != "OpenQQ" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "unsupported adapter type"})
+	if body.AdapterType != "Onebot11" {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{"message": "当前主程序仅支持 OneBot 11 适配器"})
 		return
 	}
 	if body.DisplayName == "" {
