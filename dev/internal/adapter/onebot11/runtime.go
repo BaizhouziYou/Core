@@ -169,7 +169,13 @@ func TestConnection(ctx context.Context, config Config) (map[string]any, error) 
 		if fmt.Sprint(packet["status"]) == "failed" {
 			return nil, classifyAPIResponse(packet)
 		}
+		if retcode, ok := packet["retcode"].(float64); ok && retcode != 0 {
+			return nil, classifyAPIResponse(packet)
+		}
 		data, _ := packet["data"].(map[string]any)
+		if dataString(data, "user_id") == "" {
+			return nil, &APIError{Code: "adapter_protocol_error", Message: "OneBot 身份响应缺少 user_id", Retryable: false}
+		}
 		return map[string]any{"connected": true, "authenticated": true, "selfId": dataString(data, "user_id"), "nickname": dataString(data, "nickname"), "capabilities": Capabilities}, nil
 	}
 }
@@ -342,6 +348,11 @@ func (r *Runtime) run() {
 }
 
 func (r *Runtime) readLoop(conn *websocket.Conn, result chan<- error) {
+	if r.config.UseHeartBeat {
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(time.Duration(r.config.HeartBeatInterval+5000) * time.Millisecond))
+		})
+	}
 	for {
 		if r.config.UseHeartBeat {
 			_ = conn.SetReadDeadline(time.Now().Add(time.Duration(r.config.HeartBeatInterval+5000) * time.Millisecond))

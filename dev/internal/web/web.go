@@ -533,7 +533,9 @@ func (s *server) adapterSend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "peerId and a message of 1-4000 bytes are required"})
 		return
 	}
-	messageID, err := s.adapterManager.Send(r.Context(), r.PathValue("id"), body.MessageType, body.PeerID, body.Message)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	messageID, err := s.adapterManager.Send(ctx, r.PathValue("id"), body.MessageType, body.PeerID, body.Message)
 	if err != nil {
 		writeAdapterError(w, err)
 		return
@@ -546,7 +548,9 @@ func (s *server) adapterGroups(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"message": "Adapter runtime is unavailable."})
 		return
 	}
-	groups, err := s.adapterManager.Groups(r.Context(), r.PathValue("id"))
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	groups, err := s.adapterManager.Groups(ctx, r.PathValue("id"))
 	if err != nil {
 		writeAdapterError(w, err)
 		return
@@ -573,10 +577,13 @@ func publicAdapterRecord(item store.Record) store.Record {
 		Config      json.RawMessage `json:"config"`
 	}
 	if json.Unmarshal([]byte(item.Detail), &detail) != nil {
+		item.Detail = `{"adapterType":"unknown","config":{},"configError":true}`
 		return item
 	}
 	var config map[string]json.RawMessage
 	if json.Unmarshal(detail.Config, &config) != nil {
+		publicDetail, _ := json.Marshal(map[string]any{"adapterType": detail.AdapterType, "config": map[string]any{}, "configError": true})
+		item.Detail = string(publicDetail)
 		return item
 	}
 	var token string
@@ -616,6 +623,7 @@ func preserveAccessToken(oldConfig, newConfig json.RawMessage) json.RawMessage {
 		if len(newValues["AccessToken"]) == 0 {
 			newValues["AccessToken"] = oldValues["accessToken"]
 		}
+		delete(newValues, "accessToken")
 	}
 	delete(newValues, "accessTokenConfigured")
 	result, err := json.Marshal(newValues)

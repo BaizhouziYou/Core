@@ -35,7 +35,15 @@ func (m *Manager) StartEnabled(ctx context.Context) error {
 	}
 	for _, item := range items {
 		adapterType, _, err := parseRecord(item)
-		if err != nil || adapterType != "Onebot11" || !item.Enabled {
+		if err != nil {
+			if item.Enabled {
+				m.mu.Lock()
+				m.failures[item.ID] = Status{State: StateFailed, LastError: safeMessage(err), LastErrorCode: errorCode(err)}
+				m.mu.Unlock()
+			}
+			continue
+		}
+		if adapterType != "Onebot11" || !item.Enabled {
 			continue
 		}
 		if err := m.Start(ctx, item.ID); err != nil {
