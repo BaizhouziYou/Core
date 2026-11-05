@@ -51,16 +51,20 @@ type Status struct {
 }
 
 type Event struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	MessageType string          `json:"messageType,omitempty"`
-	SelfID      string          `json:"selfId,omitempty"`
-	PeerID      string          `json:"peerId,omitempty"`
-	SenderID    string          `json:"senderId,omitempty"`
-	SenderName  string          `json:"senderName,omitempty"`
-	Content     string          `json:"content,omitempty"`
-	OccurredAt  time.Time       `json:"occurredAt"`
-	Raw         json.RawMessage `json:"raw,omitempty"`
+	ID            string          `json:"id"`
+	Type          string          `json:"type"`
+	SubType       string          `json:"subType,omitempty"`
+	MetaEventType string          `json:"metaEventType,omitempty"`
+	NoticeType    string          `json:"noticeType,omitempty"`
+	MessageID     string          `json:"messageId,omitempty"`
+	MessageType   string          `json:"messageType,omitempty"`
+	SelfID        string          `json:"selfId,omitempty"`
+	PeerID        string          `json:"peerId,omitempty"`
+	SenderID      string          `json:"senderId,omitempty"`
+	SenderName    string          `json:"senderName,omitempty"`
+	Content       string          `json:"content,omitempty"`
+	OccurredAt    time.Time       `json:"occurredAt"`
+	Raw           json.RawMessage `json:"raw,omitempty"`
 }
 
 type APIError struct {
@@ -393,7 +397,20 @@ func (r *Runtime) handleEvent(raw []byte, packet map[string]any) {
 	r.status.LastReceivedAt = &now
 	r.mu.Unlock()
 	postType, _ := packet["post_type"].(string)
-	event := Event{ID: newEcho(), Type: postType, OccurredAt: now, Raw: append(json.RawMessage(nil), raw...), SelfID: dataString(packet, "self_id")}
+	event := Event{
+		ID:            firstString(packet, "message_id", "event_id"),
+		Type:          postType,
+		SubType:       dataString(packet, "sub_type"),
+		MetaEventType: dataString(packet, "meta_event_type"),
+		NoticeType:    dataString(packet, "notice_type"),
+		MessageID:     dataString(packet, "message_id"),
+		OccurredAt:    eventTime(packet, now),
+		Raw:           append(json.RawMessage(nil), raw...),
+		SelfID:        dataString(packet, "self_id"),
+	}
+	if event.ID == "" {
+		event.ID = newEcho()
+	}
 	if postType == "message" {
 		event.MessageType = dataString(packet, "message_type")
 		if event.MessageType == "group" {
@@ -409,6 +426,23 @@ func (r *Runtime) handleEvent(raw []byte, packet map[string]any) {
 	if r.onEvent != nil {
 		r.onEvent(event)
 	}
+}
+
+func firstString(data map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := dataString(data, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func eventTime(packet map[string]any, fallback time.Time) time.Time {
+	value, ok := packet["time"].(float64)
+	if !ok || value <= 0 {
+		return fallback
+	}
+	return time.Unix(int64(value), 0).UTC()
 }
 
 func (r *Runtime) call(ctx context.Context, action string, params map[string]any) (map[string]any, error) {

@@ -88,7 +88,7 @@ func TestRuntimeReceiveSendAndStop(t *testing.T) {
 				return
 			}
 			if action == "get_login_info" {
-				_ = conn.WriteJSON(map[string]any{"post_type": "message", "message_type": "group", "self_id": 7, "group_id": 99, "user_id": 5, "raw_message": "hello", "sender": map[string]any{"nickname": "tester"}})
+				_ = conn.WriteJSON(map[string]any{"time": 1710000000, "message_id": 1234, "post_type": "message", "message_type": "group", "self_id": 7, "group_id": 99, "user_id": 5, "raw_message": "hello", "sender": map[string]any{"nickname": "tester"}})
 			}
 		}
 	}))
@@ -104,7 +104,7 @@ func TestRuntimeReceiveSendAndStop(t *testing.T) {
 	}
 	select {
 	case event := <-events:
-		if event.Type != "message" || event.MessageType != "group" || event.PeerID != "99" || event.Content != "hello" {
+		if event.Type != "message" || event.MessageID != "1234" || event.MessageType != "group" || event.PeerID != "99" || event.Content != "hello" || event.OccurredAt.Unix() != 1710000000 {
 			t.Fatalf("unexpected normalized event %#v", event)
 		}
 	case <-ctx.Done():
