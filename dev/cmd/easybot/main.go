@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"easybot/internal/adapter/onebot11"
 	"easybot/internal/config"
 	"easybot/internal/runtime"
 	"easybot/internal/store"
@@ -33,6 +34,8 @@ func main() {
 		logger.Error("listener configuration rejected", "address", address, "error", err)
 		os.Exit(1)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	logs := runtime.NewLogBuffer(500)
 	logSettings, err := db.GetLogSettings(context.Background())
 	if err != nil {
@@ -49,15 +52,19 @@ func main() {
 	}()
 	logs.Add("info", "runtime", "EasyBot API started")
 	go maintainLogs(db, logger)
+	adapters := onebot11.NewManager(ctx, db, func(id string, event onebot11.Event) {
+		logs.Add("info", "adapter.onebot11", "OneBot event received: "+event.Type+" (adapter "+id+")")
+	})
+	if err := adapters.StartEnabled(ctx); err != nil {
+		logger.Error("adapter restoration failed", "error", err)
+	}
 	server := &http.Server{
 		Addr:              address,
-		Handler:           web.New(db, logger, logs, writer),
+		Handler:           web.NewWithAdapterManager(db, logger, logs, adapters, writer),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	logger.Info("EasyBot web service listening", "address", address, "database", db.Dialect())
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	serveErr := make(chan error, 1)
 	go func() {
 		if cert != "" {
@@ -70,6 +77,7 @@ func main() {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		adapters.Shutdown(shutdownCtx)
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
