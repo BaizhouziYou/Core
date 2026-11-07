@@ -46,7 +46,16 @@ func Open(dsn string) (*Store, error) {
 	if source == "" {
 		source = os.Getenv("EASYBOT_SQLITE_PATH")
 		if source == "" {
-			source = "appdata/easybot.db"
+			executable, err := os.Executable()
+			if err != nil {
+				return nil, fmt.Errorf("resolve database directory: %w", err)
+			}
+			dir := filepath.Dir(executable)
+			// 保留开发目录 bin/easybotce 与 appdata 并列的布局。
+			if filepath.Base(dir) == "bin" {
+				dir = filepath.Dir(dir)
+			}
+			source = filepath.Join(dir, "appdata", "easybot.db")
 		}
 		if err := os.MkdirAll(filepath.Dir(source), 0750); err != nil {
 			return nil, err
@@ -72,6 +81,11 @@ func Open(dsn string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(16)
 	db.SetMaxIdleConns(4)
+	if dialect == "sqlite" {
+		// SQLite 只有一个写入者，串行使用连接，避免异步日志与管理写入争抢锁。
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+	}
 	db.SetConnMaxLifetime(30 * time.Minute)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -405,8 +419,10 @@ func (s *Store) CreateInitialAdmin(ctx context.Context, username, password, toke
 	if _, err = tx.ExecContext(ctx, s.query(`INSERT INTO users(id,username,password_hash,created_at) VALUES(?,?,?,?)`), user.ID, user.Username, string(hash), time.Now().UTC()); err != nil {
 		return Admin{}, err
 	}
-	if _, err = tx.ExecContext(ctx, s.query(`INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)`), tokenHash, user.ID, time.Now().UTC(), expiresAt.UTC()); err != nil {
-		return Admin{}, err
+	if tokenHash != "" {
+		if _, err = tx.ExecContext(ctx, s.query(`INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)`), tokenHash, user.ID, time.Now().UTC(), expiresAt.UTC()); err != nil {
+			return Admin{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Admin{}, err
@@ -433,6 +449,44 @@ func (s *Store) AuthenticateAdmin(ctx context.Context, username, password string
 func (s *Store) CreateSession(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
 	_, err := s.db.ExecContext(ctx, s.query(`INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)`), tokenHash, userID, time.Now().UTC(), expiresAt.UTC())
 	return err
+}
+
+// 沿用已有会话表的内部身份；更换 token.txt 时清除旧会话，不改变业务记录。
+func (s *Store) EnsureTokenUser(ctx context.Context, fingerprint string) (Admin, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Admin{}, err
+	}
+	defer tx.Rollback()
+	var user Admin
+	var previous string
+	err = tx.QueryRowContext(ctx, `SELECT id,username,password_hash FROM users ORDER BY created_at,id LIMIT 1`).Scan(&user.ID, &user.Username, &previous)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Admin{}, err
+	}
+	if err == nil && bcrypt.CompareHashAndPassword([]byte(previous), []byte(fingerprint)) == nil {
+		return user, tx.Commit()
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(fingerprint), bcrypt.DefaultCost)
+	if err != nil {
+		return Admin{}, err
+	}
+	if user.ID == "" {
+		user = Admin{ID: uuid.NewString(), Username: "admin"}
+		_, err = tx.ExecContext(ctx, s.query(`INSERT INTO users(id,username,password_hash,created_at) VALUES(?,?,?,?)`), user.ID, user.Username, string(hash), time.Now().UTC())
+	} else {
+		_, err = tx.ExecContext(ctx, s.query(`UPDATE users SET password_hash=? WHERE id=?`), string(hash), user.ID)
+	}
+	if err != nil {
+		return Admin{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions`); err != nil {
+		return Admin{}, err
+	}
+	if _, err := tx.ExecContext(ctx, s.query(`UPDATE setup_state SET setup_complete=? WHERE id=1`), true); err != nil {
+		return Admin{}, err
+	}
+	return user, tx.Commit()
 }
 
 func (s *Store) SessionAdmin(ctx context.Context, tokenHash string) (Admin, bool, error) {

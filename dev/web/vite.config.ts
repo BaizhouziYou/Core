@@ -5,5 +5,5 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [vue(), tailwindcss()],
   build: { cssMinify: false },
-  server: { proxy: { '/api': 'http://127.0.0.1:26990' } },
+  server: { host: '127.0.0.1', proxy: { '/api': 'http://127.0.0.1:5001' } },
 })

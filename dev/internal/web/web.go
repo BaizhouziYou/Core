@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -16,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,11 +23,15 @@ import (
 	"time"
 
 	"easybot/internal/adapter/onebot11"
+	"easybot/internal/auth"
+	"easybot/internal/config"
 	"easybot/internal/runtime"
 	"easybot/internal/store"
 )
 
 type server struct {
+	loginToken     *auth.Token
+	localOnly      bool
 	store          *store.Store
 	logger         *slog.Logger
 	logs           *runtime.LogBuffer
@@ -43,14 +47,20 @@ type loginAttempt struct {
 }
 
 const sessionCookie = "easybot_session"
-const sessionLifetime = 12 * time.Hour
+const sessionLifetime = 7 * 24 * time.Hour
 
 func New(db *store.Store, logger *slog.Logger, logs *runtime.LogBuffer, writers ...*runtime.AsyncLogWriter) http.Handler {
 	return NewWithAdapterManager(db, logger, logs, nil, writers...)
 }
 
 func NewWithAdapterManager(db *store.Store, logger *slog.Logger, logs *runtime.LogBuffer, adapters *onebot11.Manager, writers ...*runtime.AsyncLogWriter) http.Handler {
+	return NewForListener(db, logger, logs, adapters, "", nil, writers...)
+}
+
+func NewForListener(db *store.Store, logger *slog.Logger, logs *runtime.LogBuffer, adapters *onebot11.Manager, address string, token *auth.Token, writers ...*runtime.AsyncLogWriter) http.Handler {
 	s := &server{store: db, logger: logger, logs: logs, adapterManager: adapters, loginAttempts: make(map[string]loginAttempt)}
+	s.localOnly = config.IsLoopbackListener(address)
+	s.loginToken = token
 	if len(writers) > 0 {
 		s.logWriter = writers[0]
 	}
@@ -58,7 +68,6 @@ func NewWithAdapterManager(db *store.Store, logger *slog.Logger, logs *runtime.L
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/app/info", s.info)
 	mux.HandleFunc("GET /api/setup/status", s.setupStatus)
-	mux.HandleFunc("POST /api/setup/admin", s.setupAdmin)
 	mux.HandleFunc("GET /api/auth/session", s.authSession)
 	mux.HandleFunc("POST /api/auth/login", s.login)
 	mux.HandleFunc("POST /api/auth/logout", s.logout)
@@ -82,12 +91,34 @@ func NewWithAdapterManager(db *store.Store, logger *slog.Logger, logs *runtime.L
 	mux.HandleFunc("GET /api/logs", s.recentLogs)
 	mux.HandleFunc("GET /api/logs/status", s.logStatus)
 	mux.HandleFunc("PUT /api/logs/settings", s.updateLogSettings)
-	mux.Handle("/", http.FileServer(http.Dir("web/dist")))
-	return s.observe(s.security(s.cors(mux)))
+	mux.Handle("/", http.FileServer(http.Dir(staticDirectory())))
+	handler := s.security(s.cors(mux))
+	allowedHosts := os.Getenv("EASYBOT_ALLOWED_HOSTS")
+	return s.observe(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !config.AllowedHost(r.Host, allowedHosts) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "host not allowed"})
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
+}
+
+func staticDirectory() string {
+	if executable, err := os.Executable(); err == nil {
+		dir := filepath.Dir(executable)
+		for _, base := range []string{dir, filepath.Dir(dir)} {
+			candidate := filepath.Join(base, "web", "dist")
+			if info, err := os.Stat(filepath.Join(candidate, "index.html")); err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	// go run 的临时可执行文件不与前端资源放在一起。
+	return "web/dist"
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"name": "EasyBot", "status": "running", "version": "0.1.0-dev", "database": s.store.Dialect()})
+	writeJSON(w, http.StatusOK, map[string]any{"name": "EasybotCE", "status": "running", "version": "0.1.0-dev", "database": s.store.Dialect()})
 }
 
 func (s *server) info(w http.ResponseWriter, r *http.Request) {
@@ -424,7 +455,7 @@ func (s *server) updateAdapter(w http.ResponseWriter, r *http.Request) {
 	if s.adapterManager != nil {
 		if status, statusErr := s.adapterManager.Status(item.ID); statusErr == nil && status.State != onebot11.StateStopped {
 			if restartErr := s.adapterManager.Restart(r.Context(), item.ID); restartErr != nil {
-				s.logger.Warn("adapter restart after config update failed", "adapter_id", item.ID, "error", restartErr)
+				s.logger.Warn("适配器 "+item.ID+" 更新配置后重启失败", "error", restartErr)
 			}
 		}
 	}
@@ -657,15 +688,15 @@ func writeAdapterError(w http.ResponseWriter, err error) {
 }
 
 func (s *server) security(next http.Handler) http.Handler {
-	key := os.Getenv("EASYBOT_API_KEY")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.localOnly && requestIsLocal(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/") && r.Method != http.MethodOptions {
 			switch r.URL.Path {
-			case "/api/health", "/api/setup/status", "/api/setup/admin", "/api/auth/session", "/api/auth/login":
+			case "/api/health", "/api/setup/status", "/api/auth/session", "/api/auth/login":
 			default:
-				if key != "" && secureEqual(r.Header.Get("Authorization"), "Bearer "+key) {
-					break
-				}
 				cookie, err := r.Cookie(sessionCookie)
 				if err != nil {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "authentication required"})
@@ -682,6 +713,10 @@ func (s *server) security(next http.Handler) http.Handler {
 }
 
 func (s *server) setupStatus(w http.ResponseWriter, r *http.Request) {
+	if s.localOnly && requestIsLocal(r) {
+		writeJSON(w, http.StatusOK, map[string]bool{"initialized": true})
+		return
+	}
 	complete, err := s.store.SetupComplete(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "setup status unavailable"})
@@ -690,105 +725,49 @@ func (s *server) setupStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"initialized": complete})
 }
 
-func (s *server) setupAdmin(w http.ResponseWriter, r *http.Request) {
-	if !requestIsLocal(r) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"message": "initial setup is only available from localhost"})
-		return
-	}
-	var body struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if !decode(w, r, &body) {
-		return
-	}
-	body.Username = strings.ToLower(strings.TrimSpace(body.Username))
-	if !validUsername(body.Username) || len(body.Password) < 12 || len(body.Password) > 72 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "username must be 3-32 characters; password must be 12-72 bytes"})
-		return
-	}
-	complete, err := s.store.SetupComplete(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "setup status unavailable"})
-		return
-	}
-	if complete {
-		writeJSON(w, http.StatusConflict, map[string]string{"message": "initial setup is already complete"})
-		return
-	}
-	token, err := newSessionToken()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "could not create session"})
-		return
-	}
-	expires := time.Now().UTC().Add(sessionLifetime)
-	user, err := s.store.CreateInitialAdmin(r.Context(), body.Username, body.Password, sessionHash(token), expires)
-	if err != nil {
-		if strings.Contains(err.Error(), "already complete") {
-			writeJSON(w, http.StatusConflict, map[string]string{"message": "initial setup is already complete"})
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "could not initialize administrator"})
-		return
-	}
-	setSessionCookie(w, r, token, expires)
-	writeJSON(w, http.StatusCreated, map[string]string{"id": user.ID, "username": user.Username})
-}
-
 func (s *server) authSession(w http.ResponseWriter, r *http.Request) {
+	if s.localOnly && requestIsLocal(r) {
+		writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "authRequired": false})
+		return
+	}
 	cookie, err := r.Cookie(sessionCookie)
 	if err == nil {
-		if user, ok, lookupErr := s.store.SessionAdmin(r.Context(), sessionHash(cookie.Value)); lookupErr == nil && ok {
-			writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "username": user.Username})
+		if _, ok, lookupErr := s.store.SessionAdmin(r.Context(), sessionHash(cookie.Value)); lookupErr == nil && ok {
+			writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "authRequired": true})
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false, "authRequired": true})
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	if !s.allowLogin(r.RemoteAddr) {
 		w.Header().Set("Retry-After", "300")
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"message": "too many login attempts; try again later"})
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"message": "尝试次数过多，请稍后重试"})
 		return
 	}
 	var body struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Token string `json:"token"`
 	}
 	if !decode(w, r, &body) {
 		return
 	}
-	complete, err := s.store.SetupComplete(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "authentication unavailable"})
-		return
-	}
-	if !complete {
-		writeJSON(w, http.StatusConflict, map[string]string{"message": "initial setup is required"})
-		return
-	}
-	user, ok, err := s.store.AuthenticateAdmin(r.Context(), strings.ToLower(strings.TrimSpace(body.Username)), body.Password)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "authentication unavailable"})
-		return
-	}
-	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "invalid username or password"})
+	if !s.loginToken.Valid(body.Token) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"message": "登录 Token 无效"})
 		return
 	}
 	token, err := newSessionToken()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "could not create session"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "无法创建登录会话"})
 		return
 	}
 	expires := time.Now().UTC().Add(sessionLifetime)
-	if err := s.store.CreateSession(r.Context(), user.ID, sessionHash(token), expires); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "could not create session"})
+	if err := s.store.CreateSession(r.Context(), s.loginToken.UserID, sessionHash(token), expires); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "无法保存登录会话"})
 		return
 	}
 	setSessionCookie(w, r, token, expires)
-	writeJSON(w, http.StatusOK, map[string]string{"id": user.ID, "username": user.Username})
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {
@@ -832,18 +811,6 @@ func (s *server) allowLogin(remote string) bool {
 	return true
 }
 
-func validUsername(username string) bool {
-	if len(username) < 3 || len(username) > 32 {
-		return false
-	}
-	for _, char := range username {
-		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' && char != '-' && char != '.' {
-			return false
-		}
-	}
-	return true
-}
-
 func remoteIsLoopback(remote string) bool {
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {
@@ -877,7 +844,7 @@ func hostIsLoopback(value string) bool {
 	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 		host = strings.Trim(host, "[]")
 	}
-	if strings.EqualFold(host, "localhost") {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -899,10 +866,6 @@ func sessionHash(token string) string {
 
 func setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: token, Path: "/", Expires: expires, MaxAge: int(time.Until(expires).Seconds()), HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode})
-}
-
-func secureEqual(actual, expected string) bool {
-	return len(actual) == len(expected) && subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) == 1
 }
 
 func (s *server) cors(next http.Handler) http.Handler {

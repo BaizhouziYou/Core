@@ -6,23 +6,22 @@ import (
 	"strings"
 )
 
-func ValidateListener(address, apiKey, certFile, keyFile string) error {
+func IsLoopbackListener(address string) bool {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
-		return fmt.Errorf("invalid listen address: %w", err)
-	}
-	if (certFile == "") != (keyFile == "") {
-		return fmt.Errorf("EASYBOT_TLS_CERT and EASYBOT_TLS_KEY must be configured together")
+		return false
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
-	loopback := host == "localhost" || (ip != nil && ip.IsLoopback())
-	if !loopback {
-		if apiKey == "" {
-			return fmt.Errorf("EASYBOT_API_KEY is required when listening beyond loopback")
-		}
-		if certFile == "" {
-			return fmt.Errorf("EASYBOT_TLS_CERT and EASYBOT_TLS_KEY are required when listening beyond loopback")
-		}
+	return strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") || (ip != nil && ip.IsLoopback())
+}
+
+func ValidateListener(address, certFile, keyFile string) error {
+	_, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("监听地址无效: %w", err)
+	}
+	if (certFile == "") != (keyFile == "") {
+		return fmt.Errorf("TLS 证书和私钥必须成对配置；使用 HTTP 时可同时留空")
 	}
 	return nil
 }
