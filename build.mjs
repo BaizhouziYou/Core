@@ -23,7 +23,7 @@ function run(command, args, cwd) {
   }
 }
 
-run('npm', ['ci', '--no-audit', '--no-fund'], join(dev, 'web'))
+run('npm', ['ci', '--prefer-offline', '--no-audit', '--no-fund'], join(dev, 'web'))
 run('npm', ['run', 'build'], join(dev, 'web'))
 mkdirSync(join(dev, 'bin'), { recursive: true })
 const target = env.GOOS || (process.platform === 'win32' ? 'windows' : process.platform)

@@ -1,14 +1,46 @@
-name: Build and Test
+name: 构建、测试与贡献建议
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   push:
+    branches: [main]
+    tags: ['**']
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  # 与便携包编译参数保持一致，复用测试和构建缓存。
+  CGO_ENABLED: '0'
+  GOFLAGS: -trimpath
+
 jobs:
+  commit-language:
+    name: 中文描述建议
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !github.event.deleted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 验证建议规则
+        run: node --test .github/scripts/chinese-advice.test.mjs
+      - name: 提供中文描述建议
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node .github/scripts/chinese-advice.mjs
+
   go:
     strategy:
       matrix:
@@ -22,7 +54,7 @@ jobs:
           cache-dependency-path: dev/go.sum
       - name: Test
         working-directory: dev
-        run: go test ./...
+        run: go test -vet=off ./...
       - name: Vet
         working-directory: dev
         run: go vet ./...
@@ -41,19 +73,66 @@ jobs:
             release/*.zip
             release/*.tar.gz
           if-no-files-found: error
+          compression-level: 0
 
-  web:
+  mysql:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["8.4.11", "9.6.0"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.version }}
+        env:
+          MYSQL_ROOT_PASSWORD: root-test-password
+          MYSQL_DATABASE: easybot_test
+          MYSQL_USER: easybot
+          MYSQL_PASSWORD: easybot-test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot-test-password"
+          --health-interval=3s
+          --health-timeout=5s
+          --health-retries=40
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-go@v5
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: dev/web/package-lock.json
-      - name: Install dependencies
-        working-directory: dev/web
-        run: npm ci
-      - name: Build
-        working-directory: dev/web
-        run: npm run build
+          go-version-file: dev/go.mod
+          cache-dependency-path: dev/go.sum
+      - name: Test against MySQL
+        working-directory: dev
+        env:
+          EASYBOT_TEST_DATABASE_DSN: mysql://easybot:easybot-test-password@127.0.0.1:3306/easybot_test
+        # 其他包由跨平台任务覆盖；外部数据库测试每次连接新测试库执行。
+        run: go test -count=1 -vet=off ./internal/store
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_DB: easybot_test
+          POSTGRES_USER: easybot
+          POSTGRES_PASSWORD: easybot-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -h 127.0.0.1 -U easybot -d easybot_test"
+          --health-interval=3s
+          --health-timeout=5s
+          --health-retries=40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: dev/go.mod
+          cache-dependency-path: dev/go.sum
+      - name: Test against PostgreSQL
+        working-directory: dev
+        env:
+          EASYBOT_TEST_DATABASE_DSN: postgres://easybot:easybot-test-password@127.0.0.1:5432/easybot_test?sslmode=disable
+        run: go test -count=1 -vet=off ./internal/store
